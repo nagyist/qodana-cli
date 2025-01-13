@@ -1,5 +1,5 @@
 /*
- * Copyright 2021-2023 JetBrains s.r.o.
+ * Copyright 2021-2024 JetBrains s.r.o.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,8 +20,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	log "github.com/sirupsen/logrus"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -29,11 +29,12 @@ import (
 )
 
 type LicenseData struct {
-	LicenseID      string `json:"licenseId"`
-	LicenseKey     string `json:"licenseKey"`
-	ExpirationDate string `json:"expirationDate"`
-	ProjectIdHash  string `json:"projectIdHash"`
-	LicensePlan    string `json:"licensePlan"`
+	LicenseID          string `json:"licenseId"`
+	LicenseKey         string `json:"licenseKey"`
+	ExpirationDate     string `json:"expirationDate"`
+	ProjectIdHash      string `json:"projectIdHash"`
+	OrganisationIdHash string `json:"organizationIdHash"`
+	LicensePlan        string `json:"licensePlan"`
 }
 
 type LicenseToken struct {
@@ -55,28 +56,31 @@ const (
 
 	qodanaLicenseRequestCooldown = 60
 
-	qodanaLicenseUri = "/v1/linters/license-key"
+	qodanaLicenseUri       = "/linters/license-key"
+	QodanaToken            = "QODANA_TOKEN"
+	QodanaLicenseOnlyToken = "QODANA_LICENSE_ONLY_TOKEN"
+	CommunityLicensePlan   = "COMMUNITY"
 )
 
 var TokenDeclinedError = errors.New("token was declined by Qodana Cloud server")
 
-var EmptyTokenMessage = fmt.Sprintf(`Starting from version 2023.2 release versions of Qodana Linters require connection to Qodana Cloud. 
+var EmptyTokenMessage = `Starting from version 2023.2 release versions of Qodana Linters require connection to Qodana Cloud. 
 To continue using Qodana, please ensure you have an access token and provide the token as the QODANA_TOKEN environment variable.
 Obtain your token by registering at %s
 For more details, please visit: https://www.jetbrains.com/help/qodana/cloud-quickstart.html
 We also offer Community versions as an alternative. You can find them here: https://www.jetbrains.com/help/qodana/linters.html
-`, getCloudBaseUrl())
+`
 
-var EapWarnTokenMessage = fmt.Sprintf(`
+var EapWarnTokenMessage = `
 Starting from version 2023.2 release versions of Qodana Linters will require connection to Qodana Cloud. 
 For seamless transition to release versions, obtain your token by registering at %s 
 and provide the token as the QODANA_TOKEN environment variable.
-For more details, please visit: https://www.jetbrains.com/help/qodana/cloud-quickstart.html`, getCloudBaseUrl())
+For more details, please visit: https://www.jetbrains.com/help/qodana/cloud-quickstart.html`
 
-var GeneralLicenseErrorMessage = fmt.Sprintf(`
+var GeneralLicenseErrorMessage = `
 Please check if %s is accessible from your environment. 
 If you encounter any issues, please contact us at qodana-support@jetbrains.com. 
-Or use our issue tracker at https://jb.gg/qodana-issue`, getCloudBaseUrl())
+Or use our issue tracker at https://jb.gg/qodana-issue`
 
 const InvalidTokenMessage = `QODANA_TOKEN is invalid, please provide a valid token`
 
@@ -104,11 +108,11 @@ func DeserializeLicenseData(data []byte) LicenseData {
 	return ld
 }
 
-func RequestLicenseData(endpoint string, token string) ([]byte, error) {
+func (endpoints *QdApiEndpoints) RequestLicenseData(token string) ([]byte, error) {
 	attempts := getAttempts()
 	cooldown := getCooldown()
 	for i := 1; i <= attempts; i++ {
-		license, err := requestLicenseDataAttempt(endpoint, token)
+		license, err := requestLicenseDataAttempt(endpoints.LintersApiUrl, token)
 		if errors.Is(err, TokenDeclinedError) {
 			return nil, err
 		}
@@ -156,7 +160,7 @@ func requestLicenseDataAttempt(endpoint string, token string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("Reading license response failed\n. %w", err)
 	}
-	if resp.StatusCode == 403 || resp.StatusCode == 404 {
+	if resp.StatusCode == 401 || resp.StatusCode == 404 {
 		return nil, TokenDeclinedError
 	}
 	if resp.StatusCode == 200 {
@@ -199,4 +203,37 @@ func GetEnvWithDefaultInt(env string, defaultValue int) int {
 		log.Fatalf("Variable '%s' should has integer value but it has value '%s'", env, value)
 	}
 	return result
+}
+
+func SetupLicenseToken(token string) {
+	licenseOnlyToken := os.Getenv(QodanaLicenseOnlyToken)
+	if token == "" && licenseOnlyToken != "" {
+		Token = LicenseToken{
+			Token:       licenseOnlyToken,
+			LicenseOnly: true,
+		}
+	} else {
+		Token = LicenseToken{
+			Token:       token,
+			LicenseOnly: false,
+		}
+	}
+}
+
+func (endpoints *QdApiEndpoints) GetLicenseData(token string) LicenseData {
+	licenseDataResponse, err := endpoints.RequestLicenseData(token)
+	if errors.Is(err, TokenDeclinedError) {
+		log.Fatalf("License request: %v\n%s", err, DeclinedTokenErrorMessage)
+	}
+	if err != nil {
+		errMessage := fmt.Sprintf(GeneralLicenseErrorMessage, endpoints.RootEndpoint.GetCloudUrl())
+		log.Fatalf("License request: %v\n%s", err, errMessage)
+	}
+	return DeserializeLicenseData(licenseDataResponse)
+}
+
+func (endpoints *QdApiEndpoints) GetLicensePlan(token string) string {
+	licenseData := endpoints.GetLicenseData(token)
+	log.Debug(fmt.Printf("Qodana license plan: %s", licenseData.LicensePlan))
+	return licenseData.LicensePlan
 }

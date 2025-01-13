@@ -1,0 +1,13 @@
+go 1.22.8
+
+use (
+	./cdnet
+	./clang
+	./cli
+	./cloud
+	./cmd
+	./core
+	./platform
+	./sarif
+	./tooling
+)

@@ -1,5 +1,5 @@
 /*
- * Copyright 2021-2023 JetBrains s.r.o.
+ * Copyright 2021-2024 JetBrains s.r.o.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package cloud
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -25,48 +26,45 @@ import (
 )
 
 func TestGetProjectByBadToken(t *testing.T) {
-	t.Skip() // Until qodana.cloud response is fixed
-	client := NewQdClient("https://www.jetbrains.com")
-	result := client.getProject()
-	switch v := result.(type) {
-	case Success:
-		t.Errorf("Did not expect request error: %v", v)
-	case APIError:
-		if v.StatusCode > http.StatusBadRequest {
-			t.Errorf("Expected status code %d, got %d", http.StatusBadRequest, v.StatusCode)
+	apis := QdApiEndpoints{CloudApiUrl: "https://api.qodana.cloud/v1"}
+	client := apis.NewCloudApiClient("bad_token")
+	_, err := client.RequestProjectName()
+	if err == nil {
+		t.Errorf("Did not expect request success: %v", err)
+	}
+	var v *APIError
+	switch {
+	case errors.As(err, &v):
+		if v.StatusCode != http.StatusUnauthorized {
+			t.Errorf("Expected status code %d, got %d. Message %s", http.StatusUnauthorized, v.StatusCode, v.Message)
 		}
-	case RequestError:
-		t.Errorf("Did not expect request error: %v", v)
 	default:
-		t.Error("Unknown result type")
+		t.Errorf("Unknown result type")
 	}
 }
 
+// debug purpose only
 func TestGetProjectByStaging(t *testing.T) {
-	err := os.Setenv(QodanaEndpoint, "https://cloud.sssa-stgn.aws.intellij.net")
-	if err != nil {
-		t.Fatal(err)
-	}
+	endpoint := QdRootEndpoint{Host: "cloud.sssa-stgn.aws.intellij.net"}
 	token := os.Getenv("QODANA_TOKEN")
 	if token == "" {
 		t.Skip()
 	}
-	client := NewQdClient(token)
-	result := client.getProject()
-	switch v := result.(type) {
-	case APIError:
+	endpoints, err := endpoint.requestApiEndpoints()
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	client := endpoints.NewCloudApiClient(token)
+	_, err = client.RequestProjectName()
+	var v *APIError
+	switch {
+	case errors.As(err, &v):
 		if v.StatusCode > http.StatusBadRequest {
 			t.Errorf("Expected status code %d, got %d", http.StatusBadRequest, v.StatusCode)
 		}
-	case RequestError:
-		t.Errorf("Did not expect request error: %v", v)
-	}
-}
-
-func TestValidateToken(t *testing.T) {
-	client := NewQdClient("kek")
-	if projectName := client.ValidateToken(); projectName != "" {
-		t.Errorf("Problem")
+	default:
+		t.Error("Unknown result type")
 	}
 }
 
@@ -80,14 +78,12 @@ func TestGetReportUrl(t *testing.T) {
 		{
 			name:           "valid json data and url",
 			jsonData:       jsonData{Cloud: cloudInfo{URL: "https://cloud.qodana.com/report/url"}},
-			reportUrlFile:  "https://raw.qodana.com/report/url",
 			expectedReport: "https://cloud.qodana.com/report/url",
 		},
 		{
 			name:           "invalid json data, valid url file data",
 			jsonData:       jsonData{Cloud: cloudInfo{URL: ""}},
-			reportUrlFile:  "https://raw.qodana.com/report/url",
-			expectedReport: "https://raw.qodana.com/report/url",
+			expectedReport: "",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -95,10 +91,6 @@ func TestGetReportUrl(t *testing.T) {
 			jsonFile := filepath.Join(dir, openInIdeJson)
 			jsonFileData, _ := json.Marshal(tc.jsonData)
 			if err := os.WriteFile(jsonFile, jsonFileData, 0644); err != nil {
-				t.Fatal(err)
-			}
-			urlFile := filepath.Join(dir, legacyReportFile)
-			if err := os.WriteFile(urlFile, []byte(tc.reportUrlFile), 0644); err != nil {
 				t.Fatal(err)
 			}
 

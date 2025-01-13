@@ -1,5 +1,5 @@
 /*
- * Copyright 2021-2023 JetBrains s.r.o.
+ * Copyright 2021-2024 JetBrains s.r.o.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,9 @@
 package core
 
 import (
-	"encoding/xml"
+	"encoding/json"
 	"fmt"
+	"github.com/JetBrains/qodana-cli/v2024/platform"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -30,6 +31,7 @@ import (
 
 type product struct {
 	Name           string
+	IDECode        string
 	Code           string
 	Version        string
 	BaseScriptName string
@@ -39,34 +41,27 @@ type product struct {
 	EAP            bool
 }
 
-type appInfo struct {
-	XMLName xml.Name       `xml:"component"`
-	Version appInfoVersion `xml:"version"`
-	Build   appInfoBuild   `xml:"build"`
-	Names   appInfoNames   `xml:"names"`
+type Launch struct {
+	CustomCommands []struct {
+		Commands               []string
+		AdditionalJvmArguments []string
+	} `json:"customCommands"`
 }
 
-type appInfoVersion struct {
-	XMLName xml.Name `xml:"version"`
-	Major   string   `xml:"major,attr"`
-	Minor   string   `xml:"minor,attr"`
-	Eap     string   `xml:"eap,attr"`
-}
-
-type appInfoBuild struct {
-	XMLName xml.Name `xml:"build"`
-	Number  string   `xml:"number,attr"`
-	Date    string   `xml:"date,attr"`
-}
-
-type appInfoNames struct {
-	XMLName  xml.Name `xml:"names"`
-	Product  string   `xml:"product,attr"`
-	Fullname string   `xml:"fullname,attr"`
+type ProductInfoJson struct {
+	Version       string   `json:"version"`
+	BuildNumber   string   `json:"buildNumber"`
+	ProductCode   string   `json:"productCode"`
+	VersionSuffix string   `json:"versionSuffix"`
+	Launch        []Launch `json:"launch"`
 }
 
 func (p *product) IdeBin() string {
 	return filepath.Join(p.Home, "bin")
+}
+
+func (p *product) CustomPluginsPath() string {
+	return filepath.Join(p.Home, "custom-plugins")
 }
 
 func (p *product) javaHome() string {
@@ -92,6 +87,8 @@ func (p *product) JbrJava() string {
 
 func (p *product) vmOptionsEnv() string {
 	switch p.BaseScriptName {
+	case idea:
+		return "IDEA_VM_OPTIONS"
 	case phpStorm:
 		return "PHPSTORM_VM_OPTIONS"
 	case webStorm:
@@ -106,29 +103,34 @@ func (p *product) vmOptionsEnv() string {
 		return "GOLAND_VM_OPTIONS"
 	case rustRover:
 		return "RUSTROVER_VM_OPTIONS"
+	case clion:
+		return "CLION_VM_OPTIONS"
 	default:
-		return "IDEA_VM_OPTIONS"
+		log.Fatalf("Usupported base script name for vmoptions file: %s", p.BaseScriptName)
+		return ""
 	}
 }
 
 func (p *product) parentPrefix() string {
 	switch p.Code {
-	case QDPHP:
+	case platform.QDPHP:
 		return "PhpStorm"
-	case QDJS:
+	case platform.QDJS:
 		return "WebStorm"
-	case QDNET:
+	case platform.QDNET:
 		return "Rider"
-	case QDPY:
+	case platform.QDPY:
 		return "Python"
-	case QDPYC:
+	case platform.QDPYC:
 		return "PyCharmCore"
-	case QDGO:
+	case platform.QDGO:
 		return "GoLand"
-	case QDRUBY:
+	case platform.QDRUBY:
 		return "Ruby"
-	case QDRST:
+	case platform.QDRST:
 		return "RustRover"
+	case platform.QDCPP:
+		return "CLion"
 	default:
 		return "Idea"
 	}
@@ -138,7 +140,7 @@ func (p *product) IsCommunity() bool {
 	if p.Code == "" {
 		return true
 	}
-	if Contains(allSupportedFreeCodes, p.Code) {
+	if platform.Contains(platform.AllSupportedFreeCodes, p.Code) {
 		return true
 	}
 	return false
@@ -150,30 +152,36 @@ func (p *product) getProductNameFromCode() string {
 
 func getProductNameFromCode(code string) string {
 	switch code {
-	case QDJVMC:
+	case platform.QDJVMC:
 		return "Qodana Community for JVM"
-	case QDPYC:
+	case platform.QDPYC:
 		return "Qodana Community for Python"
-	case QDANDC:
+	case platform.QDANDC:
 		return "Qodana Community for Android"
-	case QDAND:
+	case platform.QDAND:
 		return "Qodana for Android"
-	case QDJVM:
+	case platform.QDJVM:
 		return "Qodana for JVM"
-	case QDPHP:
+	case platform.QDPHP:
 		return "Qodana for PHP"
-	case QDJS:
+	case platform.QDJS:
 		return "Qodana for JS"
-	case QDNET:
+	case platform.QDNET:
 		return "Qodana for .NET"
-	case QDPY:
+	case platform.QDNETC:
+		return "Qodana Community for .NET"
+	case platform.QDCL:
+		return "Qodana for C/C++"
+	case platform.QDPY:
 		return "Qodana for Python"
-	case QDGO:
+	case platform.QDGO:
 		return "Qodana for Go"
-	case QDRST:
+	case platform.QDRST:
 		return "Qodana for Rust"
-	case QDRUBY:
+	case platform.QDRUBY:
 		return "Qodana for Ruby"
+	case platform.QDCPP:
+		return "Qodana for C/C++"
 	default:
 		return "Qodana"
 	}
@@ -192,10 +200,23 @@ func (p *product) getVersionBranch() string {
 func (p *product) is233orNewer() bool {
 	number, err := strconv.Atoi(p.getVersionBranch())
 	if err != nil {
-		WarningMessage("Invalid version: ", err)
+		platform.WarningMessage("Invalid version: ", err)
 		return false
 	}
 	return number >= 233
+}
+
+func (p *product) is242orNewer() bool {
+	number, err := strconv.Atoi(p.getVersionBranch())
+	if err != nil {
+		platform.WarningMessage("Invalid version: ", err)
+		return false
+	}
+	return number >= 242
+}
+
+func (p *product) isRuby() bool {
+	return p.Code == platform.QDRUBY
 }
 
 var Prod product
@@ -205,12 +226,15 @@ func guessProduct(opts *QodanaOptions) {
 	Prod.Home = opts.Ide
 	if //goland:noinspection GoBoolExpressions
 	runtime.GOOS == "darwin" {
-		Prod.Home = filepath.Join(Prod.Home, "Contents")
+		contentsDir := filepath.Join(Prod.Home, "Contents")
+		if _, err := os.Stat(contentsDir); err == nil {
+			Prod.Home = contentsDir
+		}
 	}
 	if Prod.Home == "" {
-		if home, ok := os.LookupEnv(QodanaDistEnv); ok {
+		if home, ok := os.LookupEnv(platform.QodanaDistEnv); ok {
 			Prod.Home = home
-		} else if IsContainer() {
+		} else if platform.IsContainer() {
 			Prod.Home = "/opt/idea"
 		} else { // guess from the executable location
 			ex, err := os.Executable()
@@ -229,10 +253,10 @@ func guessProduct(opts *QodanaOptions) {
 			Prod.BaseScriptName = findIde(Prod.IdeBin())
 		}
 		if Prod.BaseScriptName == "" {
-			WarningMessage(
+			platform.WarningMessage(
 				"Supported IDE not found in %s, you can declare the path to IDE home via %s variable",
 				Prod.Home,
-				QodanaDistEnv,
+				platform.QodanaDistEnv,
 			)
 			return
 		}
@@ -246,87 +270,65 @@ func guessProduct(opts *QodanaOptions) {
 			Prod.IdeScript = filepath.Join(Prod.IdeBin(), fmt.Sprintf("%s%s", Prod.BaseScriptName, getScriptSuffix()))
 		}
 	}
-
-	treatAsRelease := os.Getenv(QodanaTreatAsRelease)
-	if _, err := os.Stat(filepath.Join(Prod.IdeBin(), qodanaAppInfoFilename)); err == nil {
-		appInfoContents := readAppInfoXml(Prod.Home)
-		Prod.Version = appInfoContents.Version.Major + "." + appInfoContents.Version.Minor
-		Prod.Build = strings.Split(appInfoContents.Build.Number, "-")[1]
-		Prod.Code = strings.Split(appInfoContents.Build.Number, "-")[0]
-		Prod.Name = appInfoContents.Names.Fullname
-		Prod.EAP = appInfoContents.Version.Eap == "true" && !(treatAsRelease == "true")
-
-	} else if productInfo := readIdeProductInfo(Prod.Home); productInfo != nil {
-		if v, ok := productInfo["version"]; ok {
-			Prod.Version = v.(string)
-		} else {
-			Prod.Version = version
-		}
-
-		if v, ok := productInfo["buildNumber"]; ok {
-			Prod.Build = v.(string)
-		} else {
-			Prod.Build = version
-		}
-
-		if v, ok := productInfo["productCode"]; ok {
-			Prod.Code = toQodanaCode(v.(string))
-			Prod.Name = Prod.getProductNameFromCode()
-		} else {
-			Prod.Code = scriptToProductCode(Prod.BaseScriptName)
-		}
-
-		if v, ok := productInfo["versionSuffix"]; ok {
-			Prod.EAP = v.(string) == "EAP"
-		} else {
-			Prod.EAP = false
-		}
-		if treatAsRelease == "true" {
-			Prod.EAP = true
-		}
+	productInfo, err := readIdeProductInfo(Prod.Home)
+	if err != nil {
+		log.Fatalf("Can't read product-info.json: %v ", err)
 	}
-
-	if !IsContainer() {
-		remove := fmt.Sprintf("-Didea.platform.prefix=%s", Prod.parentPrefix())
-		Prod.IdeScript = patchIdeScript(Prod, remove, opts.ConfDirPath())
-	}
+	Prod.Version = productInfo.Version
+	Prod.IDECode = productInfo.ProductCode
+	Prod.Code = toQodanaCode(productInfo.ProductCode)
+	Prod.Name = Prod.getProductNameFromCode()
+	Prod.Build = productInfo.BuildNumber
+	Prod.EAP = isEap(*productInfo)
 
 	log.Debug(Prod)
-	setEnv(QodanaDistEnv, Prod.Home)
+	platform.SetEnv(platform.QodanaDistEnv, Prod.Home)
+	if Prod.isRuby() {
+		platform.UnsetRubyVariables()
+	}
 }
 
-// temporary solution to fix runs in the native mode
-func patchIdeScript(product product, strToRemove string, confDirPath string) string {
-	ext := filepath.Ext(product.IdeScript)
-	newFilePath := filepath.Join(confDirPath, fmt.Sprintf("%s%s", product.BaseScriptName, ext))
-	contentBytes, err := os.ReadFile(product.IdeScript)
-	if err != nil {
-		WarningMessage("Warning, can't read original script: %s (probably test mode)", err)
-		return product.IdeScript
+func isEap(info ProductInfoJson) bool {
+	treatAsRelease := os.Getenv(platform.QodanaTreatAsRelease)
+	if treatAsRelease == "true" {
+		return true
 	}
 
-	modifiedContent := strings.ReplaceAll(string(contentBytes), strToRemove, "")
-	if //goland:noinspection GoBoolExpressions
-	runtime.GOOS == "windows" {
-		modifiedContent = strings.ReplaceAll(modifiedContent, "SET \"IDE_BIN_DIR=%~dp0\"", "SET \"IDE_BIN_DIR=%QODANA_DIST%\\bin\"")
-	} else if //goland:noinspection GoBoolExpressions
-	runtime.GOOS == "linux" {
-		modifiedContent = strings.ReplaceAll(modifiedContent, "IDE_BIN_HOME=$(dirname \"$(realpath \"$0\")\")", "IDE_BIN_HOME=$QODANA_DIST/bin")
-	} else {
-		WarningMessage("Warning, unsupported platform: %s", runtime.GOOS)
-		return product.IdeScript
-	}
-	if _, err := os.Stat(confDirPath); os.IsNotExist(err) {
-		err := os.MkdirAll(confDirPath, os.ModePerm)
-		if err != nil {
-			log.Fatalf("failed to create directory: %v", err)
+	for _, launch := range info.Launch {
+		for _, command := range launch.CustomCommands {
+			for _, cmd := range command.Commands {
+				if cmd == "qodana" {
+					for _, arg := range command.AdditionalJvmArguments {
+						if arg == "-Dqodana.eap=true" {
+							return true
+						}
+					}
+				}
+			}
 		}
 	}
 
-	err = os.WriteFile(newFilePath, []byte(modifiedContent), 0755)
-	if err != nil {
-		log.Fatal(err)
-	}
+	return false
+}
 
-	return newFilePath
+// readIdeProductInfo returns IDE info from the given path.
+func readIdeProductInfo(ideDir string) (*ProductInfoJson, error) {
+	if //goland:noinspection ALL
+	runtime.GOOS == "darwin" {
+		ideDir = filepath.Join(ideDir, "Resources")
+	}
+	productInfo := filepath.Join(ideDir, "product-info.json")
+	if _, err := os.Stat(productInfo); err != nil {
+		return nil, err
+	}
+	productInfoFile, err := os.ReadFile(productInfo)
+	if err != nil {
+		return nil, err
+	}
+	var productInfoJson ProductInfoJson
+	err = json.Unmarshal(productInfoFile, &productInfoJson)
+	if err != nil {
+		return nil, err
+	}
+	return &productInfoJson, nil
 }

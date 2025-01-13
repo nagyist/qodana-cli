@@ -12,7 +12,14 @@ updates:
           - "*"
 
   - package-ecosystem: gomod
-    directory: /
+    directories: 
+      - cdnet
+      - cli
+      - cloud
+      - cmd
+      - core
+      - platform
+      - sarif
     commit-message:
       prefix: ":arrow_up:"
     schedule:

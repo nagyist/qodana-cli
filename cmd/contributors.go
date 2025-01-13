@@ -1,5 +1,5 @@
 /*
- * Copyright 2021-2023 JetBrains s.r.o.
+ * Copyright 2021-2024 JetBrains s.r.o.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/JetBrains/qodana-cli/v2023/core"
+	"github.com/JetBrains/qodana-cli/v2024/core"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -40,17 +40,7 @@ func newContributorsCommand() *cobra.Command {
 		Long: fmt.Sprintf(`
 A command-line helper for Qodana pricing[1] to calculate active contributor(s)[2] in the given local repositories.
 
-[1] This pricing is preliminary and subject to change.
-Early adopters may receive special offers, which we 
-will announce prior to the commercial release.
-
-[2] An active contributor is anyone who has made a commit to any 
-of the projects you’ve registered in Qodana Cloud within the last 90 days, 
-regardless of when those commits were originally authored. The number of such 
-contributors will be calculated using both the commit author information 
-and the timestamp for when their contribution to the project was pushed.
-
-[3] Ultimate Plus plan currently has a discount, more information can be found on %s
+[1] More information about available Qodana plans can be found at %s
 `, core.PricingUrl),
 		Run: func(cmd *cobra.Command, args []string) {
 			if len(options.ProjectDirs) == 0 {

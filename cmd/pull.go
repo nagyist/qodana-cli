@@ -1,5 +1,5 @@
 /*
- * Copyright 2021-2023 JetBrains s.r.o.
+ * Copyright 2021-2024 JetBrains s.r.o.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,8 @@
 package cmd
 
 import (
-	"github.com/JetBrains/qodana-cli/v2023/core"
+	"github.com/JetBrains/qodana-cli/v2024/core"
+	"github.com/JetBrains/qodana-cli/v2024/platform"
 	"github.com/docker/docker/client"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -25,12 +26,15 @@ import (
 
 // newPullCommand returns a new instance of the show command.
 func newPullCommand() *cobra.Command {
-	options := &core.QodanaOptions{}
+	options := &platform.QodanaOptions{}
 	cmd := &cobra.Command{
 		Use:   "pull",
 		Short: "Pull latest version of linter",
 		Long:  `An alternative to pull an image.`,
 		Run: func(cmd *cobra.Command, args []string) {
+			if options.ConfigName == "" {
+				options.ConfigName = platform.FindQodanaYaml(options.ProjectDir)
+			}
 			options.FetchAnalyzerSettings()
 			if options.Ide != "" {
 				log.Println("Native mode is used, skipping pull")
@@ -47,6 +51,6 @@ func newPullCommand() *cobra.Command {
 	flags := cmd.Flags()
 	flags.StringVarP(&options.Linter, "linter", "l", "", "Override linter to use")
 	flags.StringVarP(&options.ProjectDir, "project-dir", "i", ".", "Root directory of the inspected project")
-	flags.StringVarP(&options.YamlName, "yaml-name", "y", core.FindQodanaYaml(options.ProjectDir), "Override qodana.yaml name")
+	flags.StringVar(&options.ConfigName, "config", "", "Set a custom configuration file instead of 'qodana.yaml'. Relative paths in the configuration will be based on the project directory.")
 	return cmd
 }

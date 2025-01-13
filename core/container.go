@@ -1,5 +1,5 @@
 /*
- * Copyright 2021-2023 JetBrains s.r.o.
+ * Copyright 2021-2024 JetBrains s.r.o.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,12 +22,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/JetBrains/qodana-cli/v2024/platform"
+	"github.com/docker/docker/api/types/backend"
+	"github.com/docker/docker/api/types/registry"
+	"github.com/docker/go-connections/nat"
 	"github.com/pterm/pterm"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	cliconfig "github.com/docker/cli/cli/config"
@@ -40,24 +45,14 @@ import (
 )
 
 const (
-	// QodanaSuccessExitCode is Qodana exit code when the analysis is successfully completed.
-	QodanaSuccessExitCode = 0
-	// QodanaFailThresholdExitCode same as QodanaSuccessExitCode, but the threshold is set and exceeded.
-	QodanaFailThresholdExitCode = 255
-	// QodanaOutOfMemoryExitCode reports an interrupted process, sometimes because of an OOM.
-	QodanaOutOfMemoryExitCode = 137
-	// QodanaEapLicenseExpiredExitCode reports an expired license.
-	QodanaEapLicenseExpiredExitCode = 7
-	// QodanaTimeoutExitCodePlaceholder is not a real exit code (it is not obtained from IDE process! and not returned from CLI)
-	// Placeholder used to identify the case when the analysis reached timeout
-	QodanaTimeoutExitCodePlaceholder = 1000
 	// officialImagePrefix is the prefix of official Qodana images.
 	officialImagePrefix      = "jetbrains/qodana"
 	dockerSpecialCharsLength = 8
+	containerJvmDebugPort    = "5005"
 )
 
 var (
-	containerLogsOptions = types.ContainerLogsOptions{
+	containerLogsOptions = container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true,
@@ -70,25 +65,31 @@ var (
 func runQodanaContainer(ctx context.Context, options *QodanaOptions) int {
 	resetScanStages()
 	docker := getContainerClient()
-
+	info, err := docker.Info(ctx)
+	if err != nil {
+		log.Fatal("Couldn't retrieve Docker daemon information", err)
+	}
+	if info.OSType != "linux" {
+		platform.ErrorMessage("Container engine is not running a Linux platform, other platforms are not supported by Qodana")
+		return 1
+	}
 	fixDarwinCaches(options)
 
 	for i, stage := range scanStages {
-		scanStages[i] = PrimaryBold("[%d/%d] ", i+1, len(scanStages)+1) + primary(stage)
+		scanStages[i] = platform.PrimaryBold("[%d/%d] ", i+1, len(scanStages)+1) + platform.Primary(stage)
 	}
 
-	if !strings.HasPrefix(options.Linter, officialImagePrefix) {
-		WarningMessage("You are using an unofficial Qodana linter: %s\n", options.Linter)
-	}
-	if !(options.SkipPull) {
+	if options.SkipPull {
+		checkImage(options.Linter)
+	} else {
 		PullImage(docker, options.Linter)
 	}
-	progress, _ := startQodanaSpinner(scanStages[0])
+	progress, _ := platform.StartQodanaSpinner(scanStages[0])
 
 	dockerConfig := getDockerOptions(options)
 	log.Debugf("docker command to run: %s", generateDebugDockerRunCommand(dockerConfig))
 
-	updateText(progress, scanStages[1])
+	platform.UpdateText(progress, scanStages[1])
 
 	runContainer(ctx, docker, dockerConfig)
 	go followLinter(docker, dockerConfig.Name, progress)
@@ -100,7 +101,49 @@ func runQodanaContainer(ctx context.Context, options *QodanaOptions) int {
 	if progress != nil {
 		_ = progress.Stop()
 	}
+	checkImage(options.Linter)
 	return int(exitCode)
+}
+
+// isUnofficialLinter checks if the linter is unofficial.
+func isUnofficialLinter(linter string) bool {
+	return !strings.HasPrefix(linter, officialImagePrefix)
+}
+
+// hasExactVersionTag checks if the linter has an exact version tag.
+func hasExactVersionTag(linter string) bool {
+	return strings.Contains(linter, ":") && !strings.Contains(linter, ":latest")
+}
+
+// isCompatibleLinter checks if the linter is compatible with the current CLI.
+func isCompatibleLinter(linter string) bool {
+	return strings.Contains(linter, platform.ReleaseVersion)
+}
+
+// checkImage checks the linter image and prints warnings if necessary.
+func checkImage(linter string) {
+	if strings.Contains(platform.Version, "nightly") || strings.Contains(platform.Version, "dev") {
+		return
+	}
+
+	if isUnofficialLinter(linter) {
+		platform.WarningMessageCI("You are using an unofficial Qodana linter: %s\n", linter)
+	}
+
+	if !hasExactVersionTag(linter) {
+		platform.WarningMessageCI(
+			"You are running a Qodana linter without an exact version tag: %s \n   Consider pinning the version in your configuration to ensure version compatibility: %s\n",
+			linter,
+			strings.Join([]string{strings.Split(linter, ":")[0], platform.ReleaseVersion}, ":"),
+		)
+	} else if !isCompatibleLinter(linter) {
+		platform.WarningMessageCI(
+			"You are using a non-compatible Qodana linter %s with the current CLI (%s) \n   Consider updating CLI or using a compatible linter %s \n",
+			linter,
+			platform.Version,
+			strings.Join([]string{strings.Split(linter, ":")[0], platform.ReleaseVersion}, ":"),
+		)
+	}
 }
 
 func fixDarwinCaches(options *QodanaOptions) {
@@ -135,7 +178,7 @@ func removePortSocket(systemDir string) error {
 }
 
 // encodeAuthToBase64 serializes the auth configuration as JSON base64 payload
-func encodeAuthToBase64(authConfig types.AuthConfig) (string, error) {
+func encodeAuthToBase64(authConfig registry.AuthConfig) (string, error) {
 	buf, err := json.Marshal(authConfig)
 	if err != nil {
 		return "", err
@@ -151,12 +194,12 @@ func checkRequiredToolInstalled(tool string) bool {
 // PrepareContainerEnvSettings checks if the host is ready to run Qodana container images.
 func PrepareContainerEnvSettings() {
 	var tool string
-	if os.Getenv(qodanaCliUsePodman) == "" && checkRequiredToolInstalled("docker") {
+	if os.Getenv(platform.QodanaCliUsePodman) == "" && checkRequiredToolInstalled("docker") {
 		tool = "docker"
 	} else if checkRequiredToolInstalled("podman") {
 		tool = "podman"
 	} else {
-		ErrorMessage(
+		platform.ErrorMessage(
 			"Docker (or podman) is not installed on the system or can't be found in PATH, refer to https://www.docker.com/get-started for installing it",
 		)
 		os.Exit(1)
@@ -166,13 +209,13 @@ func PrepareContainerEnvSettings() {
 		var exiterr *exec.ExitError
 		if errors.As(err, &exiterr) {
 			if strings.Contains(string(exiterr.Stderr), "permission denied") {
-				ErrorMessage(
+				platform.ErrorMessage(
 					"Qodana container can't be run by the current user. Please fix the container engine configuration.",
 				)
-				WarningMessage("https://docs.docker.com/engine/install/linux-postinstall/#manage-docker-as-a-non-root-user")
+				platform.WarningMessage("https://docs.docker.com/engine/install/linux-postinstall/#manage-docker-as-a-non-root-user")
 				os.Exit(1)
 			} else {
-				ErrorMessage(
+				platform.ErrorMessage(
 					"'%s ps' exited with exit code %d, perhaps docker daemon is not running?",
 					tool,
 					exiterr.ExitCode(),
@@ -187,17 +230,18 @@ func PrepareContainerEnvSettings() {
 
 // PullImage pulls docker image and prints the process.
 func PullImage(client *client.Client, image string) {
-	printProcess(
+	checkImage(image)
+	platform.PrintProcess(
 		func(_ *pterm.SpinnerPrinter) {
 			pullImage(context.Background(), client, image)
 		},
-		fmt.Sprintf("Pulling the image %s", PrimaryBold(image)),
+		fmt.Sprintf("Pulling the image %s", platform.PrimaryBold(image)),
 		"pulling the latest version of linter",
 	)
 }
 
 func isDockerUnauthorizedError(errMsg string) bool {
-	errMsg = lower(errMsg)
+	errMsg = platform.Lower(errMsg)
 	return strings.Contains(errMsg, "unauthorized") || strings.Contains(errMsg, "denied") || strings.Contains(errMsg, "forbidden")
 }
 
@@ -214,7 +258,7 @@ func pullImage(ctx context.Context, client *client.Client, image string) {
 		if err != nil {
 			log.Fatal("can't load the auth config", err)
 		}
-		encodedAuth, err := encodeAuthToBase64(types.AuthConfig(a))
+		encodedAuth, err := encodeAuthToBase64(registry.AuthConfig(a))
 		if err != nil {
 			log.Fatal("can't encode auth to base64", err)
 		}
@@ -241,13 +285,13 @@ func ContainerCleanup() {
 	if containerName != "qodana-cli" { // if containerName is not set, it means that the container was not created!
 		docker := getContainerClient()
 		ctx := context.Background()
-		containers, err := docker.ContainerList(ctx, types.ContainerListOptions{})
+		containers, err := docker.ContainerList(ctx, container.ListOptions{})
 		if err != nil {
 			log.Fatal("couldn't get the running containers ", err)
 		}
 		for _, c := range containers {
 			if c.Names[0] == fmt.Sprintf("/%s", containerName) {
-				err = docker.ContainerStop(context.Background(), c.Names[0], nil)
+				err = docker.ContainerStop(context.Background(), c.Names[0], container.StopOptions{})
 				if err != nil {
 					log.Fatal("couldn't stop the container ", err)
 				}
@@ -279,7 +323,7 @@ func CheckContainerEngineMemory() {
 	log.Debug("Docker memory limit is set to ", info.MemTotal/1024/1024, " MB")
 
 	if info.MemTotal < 4*1024*1024*1024 {
-		WarningMessage(`The container daemon is running with less than 4GB of RAM.
+		platform.WarningMessage(`The container daemon is running with less than 4GB of RAM.
    If you experience issues, consider increasing the container runtime memory limit.
    Refer to %s for more information.
 `,
@@ -289,9 +333,9 @@ func CheckContainerEngineMemory() {
 }
 
 // getDockerOptions returns qodana docker container options.
-func getDockerOptions(opts *QodanaOptions) *types.ContainerCreateConfig {
-	cmdOpts := getIdeArgs(opts)
-	ExtractQodanaEnvironment(opts.setenv)
+func getDockerOptions(opts *QodanaOptions) *backend.ContainerCreateConfig {
+	cmdOpts := GetIdeArgs(opts)
+	platform.ExtractQodanaEnvironment(opts.Setenv)
 	cachePath, err := filepath.Abs(opts.CacheDir)
 	if err != nil {
 		log.Fatal("couldn't get abs path for cache", err)
@@ -304,9 +348,9 @@ func getDockerOptions(opts *QodanaOptions) *types.ContainerCreateConfig {
 	if err != nil {
 		log.Fatal("couldn't get abs path for results", err)
 	}
-	containerName = os.Getenv(qodanaCliContainerName)
+	containerName = os.Getenv(platform.QodanaCliContainerName)
 	if containerName == "" {
-		containerName = fmt.Sprintf("qodana-cli-%s", opts.id())
+		containerName = fmt.Sprintf("qodana-cli-%s", opts.Id())
 	}
 	volumes := []mount.Mount{
 		{
@@ -343,37 +387,57 @@ func getDockerOptions(opts *QodanaOptions) *types.ContainerCreateConfig {
 	log.Debugf("volumes: %v", volumes)
 	log.Debugf("cmd: %v", cmdOpts)
 
+	portBindings := make(nat.PortMap)
+	exposedPorts := make(nat.PortSet)
+
+	if opts.JvmDebugPort > 0 {
+		log.Infof("Enabling JVM debug on port %d", opts.JvmDebugPort)
+		portBindings = nat.PortMap{
+			containerJvmDebugPort: []nat.PortBinding{
+				{
+					HostIP:   "0.0.0.0",
+					HostPort: strconv.Itoa(opts.JvmDebugPort),
+				},
+			},
+		}
+		exposedPorts = nat.PortSet{
+			containerJvmDebugPort: struct{}{},
+		}
+	}
 	var hostConfig *container.HostConfig
 	if strings.Contains(opts.Linter, "dotnet") {
 		hostConfig = &container.HostConfig{
-			AutoRemove:  os.Getenv(qodanaCliContainerKeep) == "",
-			Mounts:      volumes,
-			CapAdd:      []string{"SYS_PTRACE"},
-			SecurityOpt: []string{"seccomp=unconfined"},
+			AutoRemove:   os.Getenv(platform.QodanaCliContainerKeep) == "",
+			Mounts:       volumes,
+			CapAdd:       []string{"SYS_PTRACE"},
+			SecurityOpt:  []string{"seccomp=unconfined"},
+			PortBindings: portBindings,
 		}
 	} else {
 		hostConfig = &container.HostConfig{
-			AutoRemove: os.Getenv(qodanaCliContainerKeep) == "",
-			Mounts:     volumes,
+			AutoRemove:   os.Getenv(platform.QodanaCliContainerKeep) == "",
+			Mounts:       volumes,
+			PortBindings: portBindings,
 		}
 	}
 
-	return &types.ContainerCreateConfig{
+	return &backend.ContainerCreateConfig{
 		Name: containerName,
 		Config: &container.Config{
 			Image:        opts.Linter,
 			Cmd:          cmdOpts,
-			Tty:          IsInteractive(),
+			Tty:          platform.IsInteractive(),
 			AttachStdout: true,
 			AttachStderr: true,
 			Env:          opts.Env,
 			User:         opts.User,
+			ExposedPorts: exposedPorts,
 		},
 		HostConfig: hostConfig,
 	}
 }
 
-func generateDebugDockerRunCommand(cfg *types.ContainerCreateConfig) string {
+func generateDebugDockerRunCommand(cfg *backend.ContainerCreateConfig) string {
 	var cmdBuilder strings.Builder
 	cmdBuilder.WriteString("docker run ")
 	if cfg.HostConfig != nil && cfg.HostConfig.AutoRemove {
@@ -392,7 +456,7 @@ func generateDebugDockerRunCommand(cfg *types.ContainerCreateConfig) string {
 		cmdBuilder.WriteString(fmt.Sprintf("-u %s ", cfg.Config.User))
 	}
 	for _, env := range cfg.Config.Env {
-		if !strings.Contains(env, QodanaToken) || strings.Contains(env, QodanaLicense) || strings.Contains(env, QodanaLicenseOnlyToken) {
+		if !strings.Contains(env, platform.QodanaToken) || strings.Contains(env, platform.QodanaLicense) || strings.Contains(env, platform.QodanaLicenseOnlyToken) {
 			cmdBuilder.WriteString(fmt.Sprintf("-e %s ", env))
 		}
 	}
@@ -430,7 +494,7 @@ func getContainerExitCode(ctx context.Context, client *client.Client, id string)
 }
 
 // runContainer runs the container.
-func runContainer(ctx context.Context, client *client.Client, opts *types.ContainerCreateConfig) {
+func runContainer(ctx context.Context, client *client.Client, opts *backend.ContainerCreateConfig) {
 	createResp, err := client.ContainerCreate(
 		ctx,
 		opts.Config,
@@ -442,7 +506,7 @@ func runContainer(ctx context.Context, client *client.Client, opts *types.Contai
 	if err != nil {
 		log.Fatal("couldn't create the container ", err)
 	}
-	if err = client.ContainerStart(ctx, createResp.ID, types.ContainerStartOptions{}); err != nil {
+	if err = client.ContainerStart(ctx, createResp.ID, container.StartOptions{}); err != nil {
 		log.Fatal("couldn't bootstrap the container ", err)
 	}
 }

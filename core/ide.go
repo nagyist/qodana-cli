@@ -1,5 +1,5 @@
 /*
- * Copyright 2021-2023 JetBrains s.r.o.
+ * Copyright 2021-2024 JetBrains s.r.o.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,15 +17,13 @@
 package core
 
 import (
-	"encoding/json"
-	"encoding/xml"
-	"errors"
 	"fmt"
-	"github.com/JetBrains/qodana-cli/v2023/cloud"
-	"github.com/owenrumney/go-sarif/v2/sarif"
+	"github.com/JetBrains/qodana-cli/v2024/cloud"
+	"github.com/JetBrains/qodana-cli/v2024/platform"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,63 +37,76 @@ func getIdeExitCode(resultsDir string, c int) (res int) {
 	if c != 0 {
 		return c
 	}
-	s, err := sarif.Open(filepath.Join(resultsDir, "qodana-short.sarif.json"))
+	s, err := platform.ReadReport(filepath.Join(resultsDir, "qodana-short.sarif.json"))
 	if err != nil {
 		log.Fatal(err)
 	}
 	if len(s.Runs) > 0 && len(s.Runs[0].Invocations) > 0 {
-		if tmp := s.Runs[0].Invocations[0].ExitCode; tmp != nil {
-			res = *tmp
-			if res < QodanaSuccessExitCode || res > QodanaFailThresholdExitCode {
-				log.Printf("Wrong exitCode in sarif: %d", res)
-				return 1
-			}
-			log.Printf("IDE exit code: %d", res)
-			return res
+		res := int(s.Runs[0].Invocations[0].ExitCode)
+		if res < platform.QodanaSuccessExitCode || res > platform.QodanaFailThresholdExitCode {
+			log.Printf("Wrong exitCode in sarif: %d", res)
+			return 1
 		}
+		log.Printf("IDE exit code: %d", res)
+		return res
 	}
 	log.Printf("IDE process exit code: %d", c)
 	return c
 }
 
-func runQodanaLocal(opts *QodanaOptions) int {
+func runQodanaLocal(opts *QodanaOptions) (int, error) {
+	writeProperties(opts)
 	args := getIdeRunCommand(opts)
-	res := getIdeExitCode(opts.ResultsDir, RunCmdWithTimeout("", opts.GetAnalysisTimeout(), QodanaTimeoutExitCodePlaceholder, args...))
-	if res > QodanaSuccessExitCode && res != QodanaFailThresholdExitCode {
+	ideProcess, err := platform.RunCmdWithTimeout(
+		"",
+		os.Stdout, os.Stderr,
+		opts.GetAnalysisTimeout(),
+		platform.QodanaTimeoutExitCodePlaceholder,
+		args...,
+	)
+	res := getIdeExitCode(opts.ResultsDir, ideProcess)
+	if res > platform.QodanaSuccessExitCode && res != platform.QodanaFailThresholdExitCode {
 		postAnalysis(opts)
-		return res
+		return res, err
 	}
-	if opts.SaveReport || opts.ShowReport {
-		saveReport(opts)
-	}
+
+	saveReport(opts)
 	postAnalysis(opts)
-	return res
+	return res, err
 }
 
 func getIdeRunCommand(opts *QodanaOptions) []string {
-	args := []string{QuoteForWindows(Prod.IdeScript), "inspect", "qodana"}
-	args = append(args, getIdeArgs(opts)...)
-	args = append(args, QuoteForWindows(opts.ProjectDir), QuoteForWindows(opts.ResultsDir))
+	args := []string{platform.QuoteIfSpace(Prod.IdeScript)}
+	if !Prod.is242orNewer() {
+		args = append(args, "inspect")
+	}
+	args = append(args, "qodana")
+
+	args = append(args, GetIdeArgs(opts)...)
+	args = append(args, platform.QuoteIfSpace(opts.ProjectDir), platform.QuoteIfSpace(opts.ResultsDir))
 	return args
 }
 
-// getIdeArgs returns qodana command options.
-func getIdeArgs(opts *QodanaOptions) []string {
+// GetIdeArgs returns qodana command options.
+func GetIdeArgs(opts *QodanaOptions) []string {
 	arguments := make([]string, 0)
+	if opts.ConfigName != "" {
+		arguments = append(arguments, "--config", platform.QuoteForWindows(opts.ConfigName))
+	}
 	if opts.Linter != "" && opts.SaveReport {
 		arguments = append(arguments, "--save-report")
 	}
 	if opts.SourceDirectory != "" {
-		arguments = append(arguments, "--source-directory", QuoteForWindows(opts.SourceDirectory))
+		arguments = append(arguments, "--source-directory", platform.QuoteForWindows(opts.SourceDirectory))
 	}
 	if opts.DisableSanity {
 		arguments = append(arguments, "--disable-sanity")
 	}
 	if opts.ProfileName != "" {
-		arguments = append(arguments, "--profile-name", quoteIfSpace(opts.ProfileName))
+		arguments = append(arguments, "--profile-name", platform.QuoteIfSpace(opts.ProfileName))
 	}
 	if opts.ProfilePath != "" {
-		arguments = append(arguments, "--profile-path", QuoteForWindows(opts.ProfilePath))
+		arguments = append(arguments, "--profile-path", platform.QuoteForWindows(opts.ProfilePath))
 	}
 	if opts.RunPromo != "" {
 		arguments = append(arguments, "--run-promo", opts.RunPromo)
@@ -104,16 +115,13 @@ func getIdeArgs(opts *QodanaOptions) []string {
 		arguments = append(arguments, "--script", opts.Script)
 	}
 	if opts.Baseline != "" {
-		arguments = append(arguments, "--baseline", QuoteForWindows(opts.Baseline))
+		arguments = append(arguments, "--baseline", platform.QuoteForWindows(opts.Baseline))
 	}
 	if opts.BaselineIncludeAbsent {
 		arguments = append(arguments, "--baseline-include-absent")
 	}
 	if opts.FailThreshold != "" {
 		arguments = append(arguments, "--fail-threshold", opts.FailThreshold)
-	}
-	if opts.GitReset && opts.Commit != "" && opts.Script == "default" {
-		arguments = append(arguments, "--script", "local-changes")
 	}
 
 	if opts.fixesSupported() {
@@ -142,33 +150,33 @@ func getIdeArgs(opts *QodanaOptions) []string {
 		}
 	}
 
-	prod := opts.guessProduct()
-	if prod == QDNETC || prod == QDCL {
+	prod := opts.guessProduct() // TODO : think how it could be better handled in presence of random 3rd party linters
+	if prod == platform.QDNETC || prod == platform.QDCL {
 		// third party common options
 		if opts.NoStatistics {
 			arguments = append(arguments, "--no-statistics")
 		}
-		if prod == QDNETC {
+		if prod == platform.QDNETC {
 			// cdnet options
-			if opts.Solution != "" {
-				arguments = append(arguments, "--solution", QuoteForWindows(opts.Solution))
+			if opts.CdnetSolution != "" {
+				arguments = append(arguments, "--solution", platform.QuoteForWindows(opts.CdnetSolution))
 			}
-			if opts.Project != "" {
-				arguments = append(arguments, "--project", QuoteForWindows(opts.Project))
+			if opts.CdnetProject != "" {
+				arguments = append(arguments, "--project", platform.QuoteForWindows(opts.CdnetProject))
 			}
-			if opts.Configuration != "" {
-				arguments = append(arguments, "--configuration", opts.Configuration)
+			if opts.CdnetConfiguration != "" {
+				arguments = append(arguments, "--configuration", opts.CdnetConfiguration)
 			}
-			if opts.Platform != "" {
-				arguments = append(arguments, "--platform", opts.Platform)
+			if opts.CdnetPlatform != "" {
+				arguments = append(arguments, "--platform", opts.CdnetPlatform)
 			}
-			if opts.NoBuild {
+			if opts.CdnetNoBuild {
 				arguments = append(arguments, "--no-build")
 			}
 		} else {
 			// clang options
-			if opts.CompileCommands != "" {
-				arguments = append(arguments, "--compile-commands", QuoteForWindows(opts.CompileCommands))
+			if opts.ClangCompileCommands != "" {
+				arguments = append(arguments, "--compile-commands", platform.QuoteForWindows(opts.ClangCompileCommands))
 			}
 			if opts.ClangArgs != "" {
 				arguments = append(arguments, "--clang-args", opts.ClangArgs)
@@ -177,12 +185,26 @@ func getIdeArgs(opts *QodanaOptions) []string {
 	}
 
 	if opts.Ide == "" {
+		if startHash, err := opts.StartHash(); startHash != "" && err == nil && opts.Script == "default" {
+			arguments = append(arguments, "--diff-start", startHash)
+		}
+		if opts.DiffEnd != "" && opts.Script == "default" {
+			arguments = append(arguments, "--diff-end", opts.DiffEnd)
+		}
+		if opts.ForceLocalChangesScript && opts.Script == "default" {
+			arguments = append(arguments, "--force-local-changes-script")
+		}
+
 		if opts.AnalysisId != "" {
 			arguments = append(arguments, "--analysis-id", opts.AnalysisId)
 		}
 
 		if opts.CoverageDir != "" {
 			arguments = append(arguments, "--coverage-dir", opts.CoverageDir)
+		}
+
+		if opts.JvmDebugPort > 0 {
+			arguments = append(arguments, "--jvm-debug-port", strconv.Itoa(opts.JvmDebugPort))
 		}
 
 		for _, property := range opts.Property {
@@ -195,7 +217,11 @@ func getIdeArgs(opts *QodanaOptions) []string {
 
 // postAnalysis post-analysis stage: wait for FUS stats to upload
 func postAnalysis(opts *QodanaOptions) {
-	syncIdeaCache(opts.ProjectDir, opts.CacheDir, true)
+	err := syncIdeaCache(opts.ProjectDir, opts.CacheDir, true)
+	if err != nil {
+		log.Warnf("failed to sync .idea directory: %v", err)
+	}
+	syncConfigCache(opts, false)
 	for i := 1; i <= 600; i++ {
 		if findProcess("statistics-uploader") {
 			time.Sleep(time.Second)
@@ -214,6 +240,7 @@ var ( // base script name
 	rubyMine  = "rubymine"
 	goLand    = "goland"
 	rustRover = "rustrover"
+	clion     = "clion"
 )
 
 var supportedIdes = [...]string{
@@ -225,53 +252,33 @@ var supportedIdes = [...]string{
 	rubyMine,
 	goLand,
 	rustRover,
+	clion,
 }
 
 func toQodanaCode(baseProduct string) string {
 	switch baseProduct {
 	case "IC":
-		return QDJVMC
+		return platform.QDJVMC
 	case "PC":
-		return QDPYC
+		return platform.QDPYC
 	case "IU":
-		return QDJVM
+		return platform.QDJVM
 	case "PS":
-		return QDPHP
+		return platform.QDPHP
 	case "WS":
-		return QDJS
+		return platform.QDJS
 	case "RD":
-		return QDNET
+		return platform.QDNET
 	case "PY":
-		return QDPY
+		return platform.QDPY
 	case "GO":
-		return QDGO
+		return platform.QDGO
 	case "RM":
-		return QDRUBY
+		return platform.QDRUBY
 	case "RR":
-		return QDRST
-	default:
-		return "QD"
-	}
-}
-
-func scriptToProductCode(scriptName string) string {
-	switch scriptName {
-	case idea:
-		return QDJVM
-	case phpStorm:
-		return QDPHP
-	case webStorm:
-		return QDJS
-	case rider:
-		return QDNET
-	case pyCharm:
-		return QDPY
-	case rubyMine:
-		return QDRUBY
-	case goLand:
-		return QDGO
-	case rustRover:
-		return QDRST
+		return platform.QDRST
+	case "CL":
+		return platform.QDCPP
 	default:
 		return "QD"
 	}
@@ -286,64 +293,30 @@ func findIde(dir string) string {
 	return ""
 }
 
-// readIdeProductInfo returns IDE info from the given path.
-func readIdeProductInfo(ideDir string) map[string]interface{} {
-	if //goland:noinspection ALL
-	runtime.GOOS == "darwin" {
-		ideDir = filepath.Join(ideDir, "Resources")
-	}
-	productInfo := filepath.Join(ideDir, "product-info.json")
-	if _, err := os.Stat(productInfo); errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	productInfoFile, err := os.ReadFile(productInfo)
-	if err != nil {
-		log.Printf("Problem loading product-info.json: %v ", err)
-		return nil
-	}
-	var productInfoMap map[string]interface{}
-	err = json.Unmarshal(productInfoFile, &productInfoMap)
-	if err != nil {
-		log.Printf("Not a valid product-info.json: %v ", err)
-		return nil
-	}
-	return productInfoMap
-}
-
-func readAppInfoXml(ideDir string) appInfo {
-	bytes, _ := os.ReadFile(filepath.Join(ideDir, "bin", qodanaAppInfoFilename))
-	var appInfo appInfo
-	err := xml.Unmarshal(bytes, &appInfo)
-	if err != nil {
-		log.Fatal(err)
-	}
-	return appInfo
-}
-
 func prepareLocalIdeSettings(opts *QodanaOptions) {
 	guessProduct(opts)
 	if Prod.BaseScriptName == "" {
 		log.Fatal("IDE to run is not found")
 	}
 
-	ExtractQodanaEnvironment(setEnv)
-	SetupLicenseToken(opts)
-	SetupLicenseAndProjectHash(cloud.Token.Token)
+	platform.ExtractQodanaEnvironment(platform.SetEnv)
+	requiresToken := opts.RequiresToken(Prod.EAP || Prod.IsCommunity())
+	cloud.SetupLicenseToken(opts.LoadToken(false, requiresToken, true))
+	SetupLicenseAndProjectHash(cloud.GetCloudApiEndpoints(), cloud.Token.Token)
 	prepareDirectories(
 		opts.CacheDir,
-		opts.logDirPath(),
+		opts.LogDirPath(),
 		opts.ConfDirPath(),
 	)
-	Config = GetQodanaYaml(opts.ProjectDir)
-	writeProperties(opts)
 
-	if IsContainer() {
-		syncIdeaCache(opts.CacheDir, opts.ProjectDir, false)
+	if platform.IsContainer() {
+		err := syncIdeaCache(opts.CacheDir, opts.ProjectDir, false)
+		if err != nil {
+			log.Warnf("failed to sync .idea directory: %v", err)
+		}
+		syncConfigCache(opts, true)
 		createUser("/etc/passwd")
 	}
-
-	bootstrap(Config.Bootstrap, opts.ProjectDir)
-	installPlugins(Config.Plugins)
 }
 
 func prepareDirectories(cacheDir string, logDir string, confDir string) {
@@ -358,7 +331,7 @@ func prepareDirectories(cacheDir string, logDir string, confDir string) {
 		confDir,
 		userPrefsDir,
 	}
-	if IsContainer() {
+	if platform.IsContainer() {
 		if Prod.BaseScriptName == rider {
 			nugetDir := filepath.Join(cacheDir, nuget)
 			if err := os.Setenv("NUGET_PACKAGES", nugetDir); err != nil {
@@ -410,60 +383,98 @@ func prepareDirectories(cacheDir string, logDir string, confDir string) {
 		writeFileIfNew(filepath.Join(mavenRootDir, "settings.xml"), mavenSettingsXml)
 		writeFileIfNew(filepath.Join(ideaOptions, "path.macros.xml"), mavenPathMacroxXml)
 
-		androidSdk := os.Getenv(androidSdkRoot)
-		if androidSdk != "" && IsContainer() {
+		androidSdk := os.Getenv(platform.AndroidSdkRoot)
+		if androidSdk != "" && platform.IsContainer() {
 			writeFileIfNew(filepath.Join(ideaOptions, "project.default.xml"), androidProjectDefaultXml(androidSdk))
-			corettoSdk := os.Getenv(qodanaCorettoSdk)
+			corettoSdk := os.Getenv(platform.QodanaCorettoSdk)
 			if corettoSdk != "" {
 				writeFileIfNew(filepath.Join(ideaOptions, "jdk.table.xml"), jdkTableXml(corettoSdk))
 			}
 		}
 	}
+
+	disabledPluginsPathSrc := filepath.Join(Prod.Home, "disabled_plugins.txt")
+	disabledPluginsPathDst := filepath.Join(confDir, "disabled_plugins.txt")
+	if _, err := os.Stat(disabledPluginsPathSrc); err == nil {
+		if err := cp.Copy(disabledPluginsPathSrc, disabledPluginsPathDst); err != nil {
+			log.Fatal(err)
+		}
+	}
 }
 
 // installPlugins runs plugin installer for every plugin id in qodana.yaml.
-func installPlugins(plugins []Plugin) {
+func installPlugins(opts *QodanaOptions, plugins []platform.Plugin) {
+	if !opts.IsNative() {
+		return
+	}
+	if len(plugins) > 0 {
+		setInstallPluginsVmoptions(opts)
+	}
 	for _, plugin := range plugins {
 		log.Printf("Installing plugin %s", plugin.Id)
-		if res := RunCmd("", QuoteForWindows(Prod.IdeScript), "installPlugins", plugin.Id); res > 0 {
+		if res, err := platform.RunCmd("", platform.QuoteIfSpace(Prod.IdeScript), "installPlugins", platform.QuoteIfSpace(plugin.Id)); res > 0 || err != nil {
 			os.Exit(res)
 		}
 	}
 }
 
-// syncIdeaCache sync .idea/ content from cache and back.
-func syncIdeaCache(from string, to string, overwrite bool) {
-	opt := cp.Options{}
-	if overwrite {
-		opt.OnDirExists = func(src, dest string) cp.DirExistsAction {
-			return cp.Merge
+func syncConfigCache(opts *QodanaOptions, fromCache bool) {
+	if Prod.BaseScriptName == idea {
+		jdkTableFile := filepath.Join(opts.ConfDirPath(), "options", "jdk.table.xml")
+		cacheFile := filepath.Join(opts.CacheDir, "config", Prod.getVersionBranch(), "jdk.table.xml")
+		if fromCache {
+			if _, err := os.Stat(cacheFile); os.IsNotExist(err) {
+				return
+			}
+			if _, err := os.Stat(jdkTableFile); os.IsNotExist(err) {
+				if err := cp.Copy(cacheFile, jdkTableFile); err != nil {
+					log.Fatal(err)
+				}
+				log.Debugf("SDK table is synced from cache")
+			}
+		} else {
+			if _, err := os.Stat(jdkTableFile); os.IsNotExist(err) {
+				log.Debugf("SDK table isnt't stored to cache, file doesn't exist")
+			} else {
+				if err := cp.Copy(jdkTableFile, cacheFile); err != nil {
+					log.Fatal(err)
+				}
+				log.Debugf("SDK table is stored to cache")
+			}
 		}
-	} else {
-		opt.OnDirExists = func(src, dest string) cp.DirExistsAction {
-			return cp.Untouchable
-		}
-	}
-	src := filepath.Join(from, ".idea")
-	if _, err := os.Stat(src); os.IsNotExist(err) {
-		return
-	}
-	dst := filepath.Join(to, ".idea")
-	log.Printf("Sync IDE cache from: %s to: %s", src, dst)
-	if err := cp.Copy(src, dst, opt); err != nil {
-		log.Fatal(err)
 	}
 }
 
+// syncIdeaCache sync .idea/ content from cache and back.
+func syncIdeaCache(from string, to string, overwrite bool) error {
+	copyOptions := cp.Options{
+		OnDirExists: func(src, dest string) cp.DirExistsAction {
+			if overwrite {
+				return cp.Merge
+			}
+			return cp.Untouchable
+		},
+		OnSymlink: func(src string) cp.SymlinkAction {
+			return cp.Skip
+		},
+	}
+	src := filepath.Join(from, ".idea")
+	if _, err := os.Stat(src); os.IsNotExist(err) {
+		return fmt.Errorf("source .idea directory does not exist: %s", src)
+	}
+	dst := filepath.Join(to, ".idea")
+	log.Printf("Sync IDE cache from: %s to: %s", src, dst)
+	if err := cp.Copy(src, dst, copyOptions); err != nil {
+		return fmt.Errorf("failed to sync .idea directory: %w", err)
+	}
+
+	return nil
+}
+
+//goland:noinspection GoBoolExpressions
 func getScriptSuffix() string {
-	if IsContainer() {
-		return ".sh"
+	if runtime.GOOS == "windows" {
+		return "64.exe"
 	}
-	switch runtime.GOOS {
-	case "windows":
-		return ".bat"
-	case "darwin":
-		return ""
-	default:
-		return ".sh"
-	}
+	return ""
 }

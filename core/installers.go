@@ -1,5 +1,5 @@
 /*
- * Copyright 2021-2023 JetBrains s.r.o.
+ * Copyright 2021-2024 JetBrains s.r.o.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"github.com/JetBrains/qodana-cli/v2024/platform"
 	cp "github.com/otiai10/copy"
 	"github.com/pterm/pterm"
 	log "github.com/sirupsen/logrus"
@@ -37,21 +38,22 @@ var (
 	releaseVer  = "release"
 	eapVer      = "eap"
 	versionsMap = map[string]string{
-		releaseVer: "2023.3",
-		eapVer:     "2023.3",
+		releaseVer: "2024.2",
+		eapVer:     "2024.3",
 	}
 	Products = map[string]string{
-		QDJVM:  "IIU",
-		QDJVMC: "IIC",
+		platform.QDJVM:  "IIU",
+		platform.QDJVMC: "IIC",
 		// QDAND: // don't use it right now
 		// QDANDC: // don't use it right now
-		QDPHP: "PS",
-		QDJS:  "WS",
-		QDNET: "RD",
-		QDPY:  "PCP",
-		QDPYC: "PCC",
-		QDGO:  "GO",
-		QDRST: "RR",
+		platform.QDPHP: "PS",
+		platform.QDJS:  "WS",
+		platform.QDNET: "RD",
+		platform.QDPY:  "PCP",
+		platform.QDPYC: "PCC",
+		platform.QDGO:  "GO",
+		platform.QDRST: "RR",
+		platform.QDCPP: "CL",
 	}
 )
 
@@ -74,12 +76,21 @@ func downloadAndInstallIDE(opts *QodanaOptions, baseDir string, spinner *pterm.S
 	fileExt := filepath.Ext(fileName)
 	installDir := filepath.Join(baseDir, strings.TrimSuffix(fileName, fileExt))
 	if _, err := os.Stat(installDir); err == nil {
+		if runtime.GOOS == "windows" {
+			if dirs, err := filepath.Glob(filepath.Join(installDir, "*")); err == nil && len(dirs) == 1 {
+				installDir = dirs[0]
+			}
+		} else if runtime.GOOS == "darwin" {
+			if dirs, err := filepath.Glob(filepath.Join(installDir, "*.app")); err == nil && len(dirs) == 1 {
+				installDir = filepath.Join(dirs[0], "Contents")
+			}
+		}
 		log.Debugf("IDE already installed to %s, skipping download", installDir)
 		return installDir
 	}
 
 	downloadedIdePath := filepath.Join(baseDir, fileName)
-	err := DownloadFile(downloadedIdePath, ideUrl, spinner)
+	err := platform.DownloadFile(downloadedIdePath, ideUrl, spinner)
 	if err != nil {
 		log.Fatalf("Error while downloading IDE: %v", err)
 	}
@@ -97,12 +108,14 @@ func downloadAndInstallIDE(opts *QodanaOptions, baseDir string, spinner *pterm.S
 	}
 
 	switch fileExt {
+	case ".sit":
+		err = installIdeFromZip(downloadedIdePath, installDir)
 	case ".zip":
-		err = installIdeWindowsZip(downloadedIdePath, installDir)
+		err = installIdeFromZip(downloadedIdePath, installDir)
 	case ".exe":
 		err = installIdeWindowsExe(downloadedIdePath, installDir)
 	case ".gz":
-		err = installIdeLinux(downloadedIdePath, installDir)
+		err = installIdeFromTar(downloadedIdePath, installDir)
 	case ".dmg":
 		err = installIdeMacOS(downloadedIdePath, installDir)
 	default:
@@ -113,12 +126,25 @@ func downloadAndInstallIDE(opts *QodanaOptions, baseDir string, spinner *pterm.S
 		log.Fatalf("Error while unpacking: %v", err)
 	}
 
+	if runtime.GOOS == "windows" {
+		if dirs, err := filepath.Glob(filepath.Join(installDir, "*")); err == nil && len(dirs) == 1 {
+			installDir = dirs[0]
+		}
+	} else if runtime.GOOS == "darwin" {
+		if dirs, err := filepath.Glob(filepath.Join(installDir, "*.app")); err == nil && len(dirs) == 1 {
+			installDir = filepath.Join(dirs[0], "Contents")
+		}
+		err = downloadCustomPlugins(ideUrl, installDir, spinner)
+		if err != nil {
+			log.Warning("Error while downloading custom plugins: " + err.Error())
+		}
+	}
+
 	return installDir
 }
 
 //goland:noinspection GoBoolExpressions
 func getIde(productCode string) *ReleaseDownloadInfo {
-
 	originalCode := productCode
 	dist := releaseVer
 	if strings.HasSuffix(productCode, EapSuffix) {
@@ -127,41 +153,41 @@ func getIde(productCode string) *ReleaseDownloadInfo {
 	}
 
 	if _, ok := Products[productCode]; !ok {
-		ErrorMessage("Product code doesnt exist: ", originalCode)
+		platform.ErrorMessage("Product code doesnt exist: ", originalCode)
 		return nil
 	}
 
-	supportedCode := false
-	for _, v := range AllNativeCodes {
-		if v == productCode {
-			supportedCode = true
-			break
-		}
-	}
-
-	if !supportedCode {
-		ErrorMessage("Product code is not supported: ", originalCode)
+	if !platform.Contains(platform.AllNativeCodes, productCode) {
+		platform.ErrorMessage("Product code is not supported: ", originalCode)
 		return nil
 	}
 
 	product, err := GetProductByCode(Products[productCode])
 	if err != nil || product == nil {
-		ErrorMessage("Error while obtaining the product info")
+		platform.ErrorMessage("Error while obtaining the product info: " + err.Error())
 		return nil
 	}
 
 	release := SelectLatestCompatibleRelease(product, dist)
 	if release == nil {
-		ErrorMessage("Error while obtaining the release type: ", dist)
+		platform.ErrorMessage("Error while obtaining the release type: ", dist)
 		return nil
 	}
 
 	var downloadType string
 	switch runtime.GOOS {
 	case "darwin":
-		downloadType = "mac"
+		downloadType = "macSit"
+		_, ok := (*release.Downloads)[downloadType]
+		if !ok {
+			downloadType = "mac"
+		}
 		if runtime.GOARCH == "arm64" {
-			downloadType = "macM1"
+			downloadType = "macSitM1"
+			_, ok := (*release.Downloads)[downloadType]
+			if !ok {
+				downloadType = "macM1"
+			}
 		}
 	case "windows":
 		downloadType = "windowsZip"
@@ -185,7 +211,7 @@ func getIde(productCode string) *ReleaseDownloadInfo {
 
 	res, ok := (*release.Downloads)[downloadType]
 	if !ok {
-		ErrorMessage("Error while obtaining the release for platform type: ", downloadType)
+		platform.ErrorMessage("%s %s (%s) is not available or not supported for the current platform", productCode, *release.Version, dist)
 		return nil
 	}
 
@@ -195,29 +221,29 @@ func getIde(productCode string) *ReleaseDownloadInfo {
 
 // installIdeWindowsExe is used as a fallback, since it needs installation privileges and alters the registry
 func installIdeWindowsExe(archivePath string, targetDir string) error {
-	_, err := exec.Command(archivePath, "/S", fmt.Sprintf("/D=%s", QuoteForWindows(targetDir))).Output()
+	_, err := exec.Command(archivePath, "/S", fmt.Sprintf("/D=%s", platform.QuoteForWindows(targetDir))).Output()
 	if err != nil {
 		return fmt.Errorf("%s: %s", archivePath, err)
 	}
 	return nil
 }
 
-func installIdeWindowsZip(archivePath string, targetDir string) error {
+func installIdeFromZip(archivePath string, targetDir string) error {
 	if err := os.MkdirAll(targetDir, os.ModePerm); err != nil {
 		log.Fatal("couldn't create a directory ", err.Error())
 	}
-	_, err := exec.Command("tar", "-xf", QuoteForWindows(archivePath), "--strip-components", "2", "-C", QuoteForWindows(targetDir)).Output()
+	_, err := exec.Command("tar", "-xf", platform.QuoteForWindows(archivePath), "-C", platform.QuoteForWindows(targetDir)).Output()
 	if err != nil {
 		return fmt.Errorf("tar: %s", err)
 	}
 	return nil
 }
 
-func installIdeLinux(archivePath string, targetDir string) error {
+func installIdeFromTar(archivePath string, targetDir string) error {
 	if err := os.MkdirAll(targetDir, os.ModePerm); err != nil {
 		log.Fatal("couldn't create a directory ", err.Error())
 	}
-	_, err := exec.Command("tar", "-xf", archivePath, "-C", targetDir, "--strip-components", "2").Output()
+	_, err := exec.Command("tar", "-xf", archivePath, "-C", targetDir, "--strip-components", "1").Output()
 	if err != nil {
 		return fmt.Errorf("tar: %s", err)
 	}
@@ -253,7 +279,7 @@ func installIdeMacOS(archivePath string, targetDir string) error {
 }
 
 func verifySha256(checksumFile string, checkSumUrl string, filePath string) {
-	err := DownloadFile(checksumFile, checkSumUrl, nil)
+	err := platform.DownloadFile(checksumFile, checkSumUrl, nil)
 	if err != nil {
 		log.Fatalf("Error while downloading checksum for IDE: %v", err)
 	}
@@ -297,4 +323,36 @@ func verifySha256(checksumFile string, checkSumUrl string, filePath string) {
 		log.Fatalf("Checksums doesn't match. Expected: %s, Actual: %s", expected, actual)
 	}
 	log.Info("Checksum of downloaded IDE was verified")
+}
+
+func downloadCustomPlugins(ideUrl string, installDir string, spinner *pterm.SpinnerPrinter) error {
+	pluginsUrl := getPluginsURL(ideUrl)
+	log.Debugf("Downloading custom plugins from %s", pluginsUrl)
+	archivePath := filepath.Join(installDir, "custom-plugins.zip")
+	err := platform.DownloadFile(archivePath, pluginsUrl, spinner)
+	if err != nil {
+		return fmt.Errorf("error while downloading plugins: %v", err)
+	}
+	_, err = exec.Command("tar", "-xf", archivePath, "-C", installDir).Output()
+	if err != nil {
+		return fmt.Errorf("tar: %s", err)
+	}
+	disabledPluginsPath := filepath.Join(installDir, "custom-plugins", "disabled_plugins.txt")
+	err = cp.Copy(disabledPluginsPath, filepath.Join(installDir, "disabled_plugins.txt"))
+	if err != nil {
+		return fmt.Errorf("error while copying plugins: %s", err)
+	}
+
+	return nil
+}
+
+func getPluginsURL(ideUrl string) string {
+	pluginsUrl := strings.Replace(ideUrl, "-aarch64", "", 1)
+	if strings.Contains(pluginsUrl, ".sit") {
+		return strings.Replace(pluginsUrl, ".sit", "-custom-plugins.zip", 1)
+	} else if strings.Contains(pluginsUrl, ".win.zip") {
+		return strings.Replace(pluginsUrl, ".win.zip", "-custom-plugins.zip", 1)
+	} else {
+		return strings.Replace(pluginsUrl, ".tar.gz", "-custom-plugins.zip", 1)
+	}
 }

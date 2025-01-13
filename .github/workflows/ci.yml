@@ -7,19 +7,9 @@ on:
   pull_request:
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
-      - name: golangci-lint
-        uses: reviewdog/action-golangci-lint@v2
-
+  # lint: disabled as golangci-lint is not yet ready for Go workspaces
   test:
     runs-on: ${{ matrix.os }}
-    needs: [ lint ]
     permissions:
       checks: write
       pull-requests: write
@@ -35,7 +25,26 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          cache-dependency-path: "**/*.sum"
+          go-version-file: go.work
+      - name: Overwrite tools (to run tests only on gh repo)
+        run: |
+          touch cdnet/clt.zip tooling/baseline-cli.jar tooling/intellij-report-converter.jar tooling/qodana-fuser.jar
+          cat > go.work << EOF
+          go 1.22.8
+          
+          use (
+          ./cdnet
+          ./cli
+          ./cloud
+          ./cmd
+          ./core
+          ./platform
+          ./sarif
+          ./tooling
+          )
+          EOF
+        shell: bash
       - name: Set up gotestfmt
         uses: gotesttools/gotestfmt-action@v2
         with:
@@ -50,23 +59,17 @@ jobs:
         if: ${{ matrix.os != 'windows-latest' }}
         run: |
           set -euo pipefail
-          go test -json -v ./... -coverprofile coverage-${{ matrix.os }}.out -coverpkg=./... 2>&1 | tee /tmp/gotest.log | gotestfmt
+          go test -json -v $(go list -f '{{.Dir}}/...' -m | xargs) -coverprofile coverage-${{ matrix.os }}.out 2>&1 | tee /tmp/gotest.log | gotestfmt
         env:
           QODANA_LICENSE_ONLY_TOKEN: ${{ secrets.QODANA_LICENSE_ONLY_TOKEN }}
       - name: Run tests (with coverage) for Windows
         if: ${{ matrix.os == 'windows-latest' }}
-        run: go test -v ./... -coverprofile coverage-${{ matrix.os }}.out -coverpkg=./...
+        run: go test -v $(go list -f '{{.Dir}}/...' -m | ForEach-Object { $_ }) -coverprofile coverage-${{ matrix.os }}.out
         env:
           QODANA_LICENSE_ONLY_TOKEN: ${{ secrets.QODANA_LICENSE_ONLY_TOKEN }}
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-${{ matrix.os }}.out
-          path: coverage-${{ matrix.os }}.out
 
   code-quality:
     runs-on: ubuntu-latest
-    needs: [ lint, test ]
     permissions:
       checks: write
       pull-requests: write
@@ -77,77 +80,49 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Overwrite tools (to run tests only on gh repo)
+        run: |
+          touch cdnet/clt.zip tooling/baseline-cli.jar tooling/intellij-report-converter.jar tooling/qodana-fuser.jar
+          cat > go.work << EOF
+          go 1.22.8
+
+          use (
+          ./cdnet
+          ./cli
+          ./cloud
+          ./cmd
+          ./core
+          ./platform
+          ./sarif
+          ./tooling
+          )
+          EOF
+        shell: bash
       - uses: docker/login-action@v3
         with:
           registry: registry.jetbrains.team
           username: ${{ secrets.SPACE_USERNAME }}
           password: ${{ secrets.SPACE_PASSWORD }}
-      - name: Download all coverage artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/setup-go@v5
         with:
-          path: cov/
-      - name: Merge coverage profiles
-        run: |
-          go install -v github.com/hansboder/gocovmerge@latest
-          mkdir -p .qodana/code-coverage
-          export PATH=$PATH:$(go env GOPATH)/bin
-          ls -R cov/
-          gocovmerge cov/coverage-macos-latest.out/coverage-macos-latest.out cov/coverage-ubuntu-latest.out/coverage-ubuntu-latest.out cov/coverage-windows-latest.out/coverage-windows-latest.out > .qodana/code-coverage/coverage.out
+          cache-dependency-path: "**/*.sum"
+          go-version-file: go.work
       - uses: JetBrains/qodana-action@main
         env:
           QODANA_TOKEN: ${{ secrets.QODANA_TOKEN }}
+        with:
+          use-nightly: true
+          pr-mode: false
+          upload-result: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qodana-artifacts
+          path: "${{ runner.temp }}/qodana/results"
       - uses: github/codeql-action/init@v3
         with:
           languages: go
       - uses: github/codeql-action/autobuild@v3
       - uses: github/codeql-action/analyze@v3
-
-  release-nightly:
-    runs-on: ubuntu-latest
-    needs: [ lint, test, code-quality ]
-    permissions:
-      checks: write
-      pull-requests: write
-      actions: read
-      contents: write
-      security-events: write
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
-      - name: install chocolatey
-        run: |
-          mkdir -p /opt/chocolatey
-          wget -q -O - "https://github.com/chocolatey/choco/releases/download/${CHOCOLATEY_VERSION}/chocolatey.v${CHOCOLATEY_VERSION}.tar.gz" | tar -xz -C "/opt/chocolatey"
-          echo '#!/bin/bash' >> /usr/local/bin/choco
-          echo 'mono /opt/chocolatey/choco.exe $@' >> /usr/local/bin/choco
-          chmod +x /usr/local/bin/choco
-        env:
-          CHOCOLATEY_VERSION: 1.2.0
-      - uses: goreleaser/goreleaser-action@v5
-        with:
-          distribution: goreleaser
-          version: latest
-          args: --snapshot --clean --debug
-      - run: |
-          cd dist
-          gh release --repo JetBrains/qodana-cli delete nightly -y || true
-          git push --delete origin nightly || true
-          gh release --repo JetBrains/qodana-cli create nightly -p -t nightly
-          gh release --repo JetBrains/qodana-cli upload nightly \
-            qodana_darwin_arm64.tar.gz \
-            qodana_darwin_x86_64.tar.gz \
-            qodana_linux_arm64.tar.gz \
-            qodana_linux_x86_64.tar.gz \
-            qodana_windows_arm64.zip \
-            qodana_windows_x86_64.zip
-          gh release --repo JetBrains/qodana-cli edit nightly --draft=false
-        env:
-          GH_TOKEN: ${{ github.token }}
 
 #  install-script-check:
 #    strategy:

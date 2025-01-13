@@ -1,5 +1,5 @@
 /*
- * Copyright 2021-2023 JetBrains s.r.o.
+ * Copyright 2021-2024 JetBrains s.r.o.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/JetBrains/qodana-cli/v2024/platform"
+	log "github.com/sirupsen/logrus"
 	"io"
 	"os"
 	"os/exec"
@@ -30,18 +32,12 @@ import (
 	"strings"
 	"testing"
 
-	log "github.com/sirupsen/logrus"
-
-	"github.com/JetBrains/qodana-cli/v2023/core"
+	"github.com/JetBrains/qodana-cli/v2024/core"
 )
 
 func createProject(t *testing.T, name string) string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	location := filepath.Join(home, ".qodana_scan_", name)
-	err = os.MkdirAll(location, 0o755)
+	location := filepath.Join(os.TempDir(), ".qodana_scan_", name)
+	err := os.MkdirAll(location, 0o755)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,34 +50,6 @@ func createProject(t *testing.T, name string) string {
 		t.Fatal(err)
 	}
 	return location
-}
-
-func createNativeProject(t *testing.T, name string) string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	location := filepath.Join(home, ".qodana_scan_", name)
-	err = gitClone("https://github.com/hybloid/BadRulesProject", location)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return location
-}
-
-func gitClone(repoURL, directory string) error {
-	if _, err := os.Stat(directory); !os.IsNotExist(err) {
-		err = os.RemoveAll(directory)
-		if err != nil {
-			return err
-		}
-	}
-	cmd := exec.Command("git", "clone", repoURL, directory)
-	err := cmd.Run()
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 // TestVersion verifies that the version command returns the correct version
@@ -98,7 +66,7 @@ func TestVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := fmt.Sprintf("qodana version %s\n", core.Version)
+	expected := fmt.Sprintf("qodana version %s\n", platform.Version)
 	actual := string(out)
 	if expected != actual {
 		t.Fatalf("expected \"%s\" got \"%s\"", expected, actual)
@@ -179,16 +147,16 @@ func TestInitCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	filename := core.FindQodanaYaml(projectPath)
+	filename := platform.FindQodanaYaml(projectPath)
 
 	if filename != "qodana.yml" {
 		t.Fatalf("expected \"qodana.yml\" got \"%s\"", filename)
 	}
 
-	qodanaYaml := core.LoadQodanaYaml(projectPath, filename)
+	qodanaYaml := platform.LoadQodanaYaml(projectPath, filename)
 
-	if qodanaYaml.Linter != core.Image(core.QDPYC) {
-		t.Fatalf("expected \"%s\", but got %s", core.Image(core.QDPYC), qodanaYaml.Linter)
+	if qodanaYaml.Linter != platform.Image(platform.QDPY) {
+		t.Fatalf("expected \"%s\", but got %s", platform.Image(platform.QDPY), qodanaYaml.Linter)
 	}
 
 	err = os.RemoveAll(projectPath)
@@ -253,7 +221,14 @@ func TestPullInNative(t *testing.T) {
 }
 
 func TestAllCommandsWithContainer(t *testing.T) {
+	platform.Version = "0.1.0"
 	linter := "registry.jetbrains.team/p/sa/containers/qodana-dotnet:latest"
+
+	token := os.Getenv("QODANA_LICENSE_ONLY_TOKEN")
+	if //goland:noinspection GoBoolExpressions
+	token == "" {
+		t.Skip("set your token here to run the test")
+	}
 
 	if os.Getenv("GITHUB_ACTIONS") == "true" {
 		//goland:noinspection GoBoolExpressions
@@ -263,12 +238,18 @@ func TestAllCommandsWithContainer(t *testing.T) {
 	}
 	//_ = os.Setenv(qodanaCliContainerKeep, "true")
 	//_ = os.Setenv(qodanaCliContainerName, "qodana-cli-test-new1")
-	core.DisableColor()
-	core.CheckForUpdates("0.1.0")
+	platform.DisableColor()
+	core.CheckForUpdates(platform.Version)
 	projectPath := createProject(t, "qodana_scan_python")
-	cachePath := createProject(t, "cache")
+
+	// create temp directory for cache
+	cachePath := filepath.Join(os.TempDir(), "qodana_cache")
+	err := os.MkdirAll(cachePath, 0o755)
+	if err != nil {
+		t.Fatal(err)
+	}
 	resultsPath := filepath.Join(projectPath, "results")
-	err := os.MkdirAll(resultsPath, 0o755)
+	err = os.MkdirAll(resultsPath, 0o755)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,28 +264,45 @@ func TestAllCommandsWithContainer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 2; i++ { // run scan with a container twice to check the cache
-		out = bytes.NewBufferString("")
-		// set debug log to debug
-		log.SetLevel(log.DebugLevel)
-		command = newScanCommand()
-		command.SetOut(out)
-		command.SetArgs([]string{
-			"-i", projectPath,
-			"-o", resultsPath,
-			"--cache-dir", cachePath,
-			"-v", filepath.Join(projectPath, ".idea") + ":/data/some",
-			"--fail-threshold", "5",
-			"--print-problems",
-			"--apply-fixes",
-			"-l", linter,
-			"--property",
-			"idea.headless.enable.statistics=false",
-		})
-		err = command.Execute()
-		if err != nil {
-			t.Fatal(err)
-		}
+	// scan without configuration
+	scanArgs := []string{
+		"-i", projectPath,
+		"-o", resultsPath,
+		"--cache-dir", cachePath,
+		"-v", filepath.Join(projectPath, ".idea") + ":/data/some",
+		"-e", platform.QodanaLicenseOnlyToken + "=" + os.Getenv("QODANA_LICENSE_ONLY_TOKEN"),
+		"--fail-threshold", "5",
+		"--print-problems",
+		"--apply-fixes",
+		"--property",
+		"idea.headless.enable.statistics=false",
+	}
+	out = bytes.NewBufferString("")
+	// set debug log to debug
+	log.SetLevel(log.DebugLevel)
+	command = newScanCommand()
+	command.SetOut(out)
+	command.SetArgs(scanArgs)
+	err = command.Execute()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// second scan with a configuration and cache
+	yamlFile := filepath.Join(projectPath, "qodana.yml")
+	err = os.WriteFile(yamlFile, []byte(fmt.Sprintf("linter: %s", linter)), 0o755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out = bytes.NewBufferString("")
+	// set debug log to debug
+	log.SetLevel(log.DebugLevel)
+	command = newScanCommand()
+	command.SetOut(out)
+	command.SetArgs(scanArgs)
+	err = command.Execute()
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	// view
@@ -381,17 +379,12 @@ func TestAllCommandsWithContainer(t *testing.T) {
 
 func TestScanWithIde(t *testing.T) {
 	log.SetLevel(log.DebugLevel)
-	ide := "QDNET"
 	token := os.Getenv("QODANA_LICENSE_ONLY_TOKEN")
 	if //goland:noinspection GoBoolExpressions
 	token == "" {
 		t.Skip("set your token here to run the test")
 	}
-	if //goland:noinspection GoBoolExpressions
-	runtime.GOOS == "darwin" {
-		t.Skip("Mac OS not supported in native")
-	}
-	projectPath := createNativeProject(t, "qodana_scan_rd")
+	projectPath := ".."
 	resultsPath := filepath.Join(projectPath, "results")
 	err := os.MkdirAll(resultsPath, 0o755)
 	if err != nil {
@@ -404,7 +397,7 @@ func TestScanWithIde(t *testing.T) {
 	command.SetArgs([]string{
 		"-i", projectPath,
 		"-o", resultsPath,
-		"--ide", ide,
+		"--ide", "QDGO",
 		"--property",
 		"idea.headless.enable.statistics=false",
 	})
