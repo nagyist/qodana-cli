@@ -1,17 +1,16 @@
 package main
 
 import (
-	"github.com/JetBrains/qodana-cli/internal/foundation/exec"
 	"fmt"
 	"os"
 	"os/signal"
 	"path"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/JetBrains/qodana-cli/internal/foundation/exec"
 	"github.com/JetBrains/qodana-cli/internal/foundation/fs"
 	"github.com/JetBrains/qodana-cli/internal/platform"
 	"github.com/JetBrains/qodana-cli/internal/platform/thirdpartyscan"
@@ -23,10 +22,18 @@ const spinnerIndex = 34
 const spinnerInterval = 100 * time.Millisecond
 
 // runClangTidyUnderProgress runs clang-tidy for each file in filesAndCompilers and shows a progress bar.
-func runClangTidyUnderProgress(c thirdpartyscan.Context, filesAndCompilers []FileWithHeaders, checks string) {
+// configFile, when non-empty, is passed to clang-tidy via --config-file=.
+// extraClangArgs is the already-parsed user --clang-args (see prepareClangArgs).
+func runClangTidyUnderProgress(
+	c thirdpartyscan.Context,
+	filesAndCompilers []FileWithHeaders,
+	checks string,
+	configFile string,
+	extraClangArgs []string,
+) {
 	spin := initializeSpinner()
 	stdoutChannel, stderrChannel := createFileLoggers(c.LogDir())
-	worker(c, filesAndCompilers, checks, spin, stdoutChannel, stderrChannel)
+	worker(c, filesAndCompilers, checks, configFile, extraClangArgs, spin, stdoutChannel, stderrChannel)
 }
 
 func initializeSpinner() *spinner.Spinner {
@@ -57,6 +64,8 @@ func worker(
 	c thirdpartyscan.Context,
 	filesAndCompilers []FileWithHeaders,
 	checks string,
+	configFile string,
+	extraClangArgs []string,
 	spin *spinner.Spinner,
 	stdoutChannel, stderrChannel chan string,
 ) {
@@ -94,6 +103,8 @@ func worker(
 						counter,
 						input,
 						checks,
+						configFile,
+						extraClangArgs,
 						c,
 						platform.GetTmpResultsDir(c.ResultsDir()),
 						stderrChannel,
@@ -118,27 +129,45 @@ func worker(
 }
 
 // runClangTidy runs clang-tidy for a single file.
+//
+// configFile, when non-empty, is forwarded as --config-file=<path>. It is
+// inserted before the extraClangArgs splice so that a user-supplied
+// --config-file= appearing earlier than a `--` separator in extraClangArgs
+// wins (clang-tidy's --config-file is a cl::opt — last occurrence wins).
+// Tokens after `--` are forwarded to the compiler and do not reach
+// clang-tidy's own option parser.
+//
+// extraClangArgs is the already-parsed user --clang-args (see
+// prepareClangArgs). It is appended verbatim to the argv.
 func runClangTidy(
 	counter int,
 	input FileWithHeaders,
 	checks string,
+	configFile string,
+	extraClangArgs []string,
 	c thirdpartyscan.Context,
 	tmpResultsDir string,
 	stderrChannel chan string,
 	stdoutChannel chan string,
 ) error {
 	clangPath := c.ClangPath()
-	args := []string{
-		checks,
+	var args []string
+	if checks != "" {
+		args = append(args, checks)
+	}
+	if configFile != "" {
+		args = append(args, "--config-file="+configFile)
+	}
+	args = append(args,
 		"-p",
 		c.ClangCompileCommands(),
 		"--export-sarif",
 		path.Join(tmpResultsDir, fmt.Sprintf("%d.sarif.json", counter)),
-	}
+	)
 	args = append(args, input.Headers...)
 	args = append(args, input.File)
 	args = append(args, "--quiet")
-	args = append(args, strings.Split(c.ClangArgs(), " ")...)
+	args = append(args, extraClangArgs...)
 	stdout, stderr, _, err := exec.ExecRedirectOutput(
 		c.ProjectDir(),
 		clangPath, args...,
